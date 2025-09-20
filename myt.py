@@ -5,17 +5,18 @@ from datetime import datetime
 from dotenv import load_dotenv
 import os
 import argparse
+from croniter import croniter
+import signal
+import sys
 
-# Load environment variables
 load_dotenv()
-
-# Router configuration with defaults
 ROUTER_USERNAME = os.getenv('ROUTER_USERNAME', 'root')
-ROUTER_PASSWORD = os.getenv('ROUTER_PASSWORD', 'YWRtaW4%3D')  # Default: Base64 encoded "admin"
+ROUTER_PASSWORD = os.getenv('ROUTER_PASSWORD', 'YWRtaW4%3D')
 ROUTER_IP = os.getenv('ROUTER_IP', '192.168.100.1')
 WAN_USERNAME = os.getenv('WAN_USERNAME')
 WAN_PASSWORD = os.getenv('WAN_PASSWORD')
 LOG_FILE = os.getenv('LOG_FILE', './myt.log')
+CRON_SCHEDULE = os.getenv('CRON_SCHEDULE')
 
 def log_public_ip(message="Current public IP"):
     """Get the current public IP address and log it with timestamp."""
@@ -34,7 +35,6 @@ def get_router_session():
     """Create and return an authenticated session with the router."""
     session = requests.Session()
     
-    # First request to get token
     response = session.post(
         f"http://{ROUTER_IP}/asp/GetRandCount.asp", verify=False, timeout=5
     )
@@ -50,14 +50,12 @@ def get_router_session():
     token = token[:48] if len(token) > 48 else token
     print("Got hwtoken")
 
-    # Login request
     data = f"UserName={ROUTER_USERNAME}&PassWord={ROUTER_PASSWORD}&Language=english&x.X_HW_Token={token}"
     response = session.post(
         f"http://{ROUTER_IP}/login.cgi", data=data, verify=False, timeout=5
     )
     print("Successfully logged in")
 
-    # Get onttoken
     response = session.get(f"http://{ROUTER_IP}/index.asp", verify=False, timeout=5)
     soup = BeautifulSoup(response.text, "html.parser")
     onttoken = soup.find(id="onttoken").get("value")
@@ -121,26 +119,115 @@ def check_wan_credentials():
         return False
     return True
 
+def validate_cron_schedule(cron_expr):
+    """Validate a cron expression."""
+    try:
+        croniter(cron_expr)
+        return True
+    except Exception as e:
+        print(f"Invalid cron expression '{cron_expr}': {e}")
+        return False
+
+def get_next_run_time(cron_expr):
+    """Get the next run time for a cron expression."""
+    try:
+        cron = croniter(cron_expr, datetime.now())
+        return cron.get_next(datetime)
+    except Exception as e:
+        print(f"Error calculating next run time: {e}")
+        return None
+
+def run_scheduled_task(operation, dry_run=False):
+    """Run the specified operation (reboot or reconnect)."""
+    print(f"\n{'='*50}")
+    print(f"Running scheduled {operation} at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"{'='*50}")
+    
+    if operation == 'reconnect' and not check_wan_credentials():
+        return False
+    
+    log_public_ip("Start IP")
+    
+    try:
+        session, onttoken = get_router_session()
+        
+        if operation == 'reboot':
+            reboot_router(session, onttoken, dry_run)
+            print("Waiting for 120 seconds before final IP check...")
+            time.sleep(120)
+        elif operation == 'reconnect':
+            reconnect_router(session, onttoken, dry_run)
+            print("Waiting for 10 seconds before final IP check...")
+            time.sleep(10)
+        
+        log_public_ip("End   IP")
+        return True
+        
+    except Exception as e:
+        print(f"Error during scheduled {operation}: {e}")
+        return False
+
+def signal_handler(signum, frame):
+    """Handle interrupt signals gracefully."""
+    print(f"\nReceived signal {signum}. Shutting down gracefully...")
+    sys.exit(0)
+
 def main():
     parser = argparse.ArgumentParser(description='Router management script')
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument('--reboot', action='store_true', help='Reboot the router')
     group.add_argument('--reconnect', action='store_true', help='Reconnect the router')
+    group.add_argument('--schedule', action='store_true', help='Run on a schedule defined by CRON_SCHEDULE env var')
     parser.add_argument('--dry-run', action='store_true', help='Simulate the operation without making changes')
+    parser.add_argument('--operation', choices=['reboot', 'reconnect'], 
+                       help='Operation to perform when using --schedule (default: reconnect)')
     
     args = parser.parse_args()
     
     if args.dry_run:
         print("Running in dry-run mode - no changes will be made")
     
-    # Check WAN credentials if reconnect is chosen
+    # Handle schedule mode
+    if args.schedule:
+        if not CRON_SCHEDULE:
+            print("Error: CRON_SCHEDULE environment variable must be set for schedule mode")
+            print("Example: CRON_SCHEDULE='0 2 * * *' (runs daily at 2 AM)")
+            return
+        
+        if not validate_cron_schedule(CRON_SCHEDULE):
+            return
+        
+        operation = args.operation or 'reconnect'
+        
+        if operation == 'reconnect' and not check_wan_credentials():
+            return
+        
+        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGTERM, signal_handler)
+        
+        print(f"Starting scheduled {operation} mode with cron: {CRON_SCHEDULE}")
+        print("Press Ctrl+C to stop")
+        
+        while True:
+            next_run = get_next_run_time(CRON_SCHEDULE)
+            if next_run:
+                print(f"Next {operation} scheduled for: {next_run.strftime('%Y-%m-%d %H:%M:%S')}")
+                
+                sleep_seconds = (next_run - datetime.now()).total_seconds()
+                if sleep_seconds > 0:
+                    print(f"Sleeping for {sleep_seconds:.0f} seconds...")
+                    time.sleep(sleep_seconds)
+                
+                run_scheduled_task(operation, args.dry_run)
+            else:
+                print("Error calculating next run time. Exiting.")
+                break
+        return
+    
     if args.reconnect and not check_wan_credentials():
         return
     
-    # Log initial IP
     log_public_ip("Start IP")
-    
-    # Get authenticated session
     session, onttoken = get_router_session()
     
     if args.reboot:
@@ -152,7 +239,6 @@ def main():
         print("Waiting for 10 seconds before final IP check...")
         time.sleep(10)
     
-    # Log final IP
     log_public_ip("End   IP")
 
 if __name__ == "__main__":
